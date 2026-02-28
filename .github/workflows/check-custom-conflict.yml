@@ -1,0 +1,105 @@
+# 合并前自动检测：upstream 更新是否与我们的自定义代码冲突
+# 在每个 upstream-sync PR 上自动运行
+
+name: 自定义代码冲突检测
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  check-conflicts:
+    runs-on: ubuntu-latest
+    if: contains(github.head_ref, 'upstream-sync')
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 获取我们的定制分支
+        run: |
+          git fetch origin develop
+          git fetch origin ${{ github.head_ref }}
+
+      - name: 检测冲突文件
+        id: conflicts
+        run: |
+          echo "## 🔍 自定义代码冲突检测报告" > /tmp/report.md
+          echo "" >> /tmp/report.md
+
+          # 1. 检查 custom_enterprise 目录是否被 upstream 影响
+          echo "### 1. custom_enterprise 目录检查" >> /tmp/report.md
+          if git diff origin/develop..HEAD --name-only | grep -q "custom_enterprise/"; then
+            echo "⚠️ **upstream 修改了 custom_enterprise 目录！需要仔细审查**" >> /tmp/report.md
+            git diff origin/develop..HEAD --name-only | grep "custom_enterprise/" >> /tmp/report.md
+          else
+            echo "✅ custom_enterprise 目录未受影响" >> /tmp/report.md
+          fi
+          echo "" >> /tmp/report.md
+
+          # 2. 检查我们修改过的文件是否与 upstream 冲突
+          echo "### 2. 已修改文件冲突检查" >> /tmp/report.md
+
+          # Get files we've changed (comparing our develop with the upstream's parent)
+          OUR_CHANGES=$(git log origin/develop --format="" --name-only | sort -u)
+
+          # Get files upstream changed in this PR
+          UPSTREAM_CHANGES=$(git diff origin/develop..HEAD --name-only | sort -u)
+
+          # Find overlapping files
+          CONFLICTS=$(comm -12 <(echo "$OUR_CHANGES") <(echo "$UPSTREAM_CHANGES"))
+
+          if [ -n "$CONFLICTS" ]; then
+            COUNT=$(echo "$CONFLICTS" | wc -l)
+            echo "⚠️ **发现 $COUNT 个文件可能冲突（我们改过，upstream 也改了）：**" >> /tmp/report.md
+            echo '```' >> /tmp/report.md
+            echo "$CONFLICTS" >> /tmp/report.md
+            echo '```' >> /tmp/report.md
+            echo "conflict=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ 无冲突文件" >> /tmp/report.md
+            echo "conflict=false" >> $GITHUB_OUTPUT
+          fi
+          echo "" >> /tmp/report.md
+
+          # 3. 检查关键目录的变更（需要重点审查的）
+          echo "### 3. 重点审查目录" >> /tmp/report.md
+          for dir in "app/views" "app/models" "config/locales" "app/javascript" "config/routes" "db/migrate"; do
+            count=$(git diff origin/develop..HEAD --name-only | grep "^$dir/" | wc -l)
+            if [ "$count" -gt 0 ]; then
+              echo "⚠️ **$dir/** — $count 个文件变更" >> /tmp/report.md
+            fi
+          done
+          echo "" >> /tmp/report.md
+
+          # 4. 检查是否有 Git 合并冲突标记
+          echo "### 4. 合并冲突标记检查" >> /tmp/report.md
+          MERGE_CONFLICTS=$(git diff origin/develop..HEAD --diff-filter=U --name-only 2>/dev/null || echo "")
+          if [ -n "$MERGE_CONFLICTS" ]; then
+            echo "❌ **存在无法自动合并的冲突！必须手动解决：**" >> /tmp/report.md
+            echo "$MERGE_CONFLICTS" >> /tmp/report.md
+            echo "merge_conflict=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ 无合并冲突" >> /tmp/report.md
+            echo "merge_conflict=false" >> $GITHUB_OUTPUT
+          fi
+
+          # 5. Summary
+          echo "" >> /tmp/report.md
+          echo "---" >> /tmp/report.md
+          echo "### 结论" >> /tmp/report.md
+          if [ "${{ steps.conflicts.outputs.merge_conflict }}" = "true" ]; then
+            echo "❌ **有合并冲突，不可直接合并。** 请让 AI 处理冲突后再审批。" >> /tmp/report.md
+          elif [ "${{ steps.conflicts.outputs.conflict }}" = "true" ]; then
+            echo "⚠️ **有潜在冲突文件，建议仔细检查后再合并。**" >> /tmp/report.md
+          else
+            echo "✅ **无冲突，可以安全合并。**" >> /tmp/report.md
+          fi
+
+          cat /tmp/report.md
+
+      - name: 发布检测报告到 PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: /tmp/report.md
