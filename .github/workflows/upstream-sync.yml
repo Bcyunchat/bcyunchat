@@ -1,0 +1,84 @@
+# 从 Chatwoot 官方拉取更新，自动创建 PR 供人工审批
+# 绝不自动合并，必须人工确认后才能合入
+
+name: Upstream Sync（官方更新同步）
+
+on:
+  schedule:
+    # 每周一早上 9 点（东京时间）自动检查
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    # 也可以手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 添加 upstream 并拉取
+        run: |
+          git remote add upstream https://github.com/chatwoot/chatwoot.git || true
+          git fetch upstream develop
+
+      - name: 检查是否有新更新
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/develop --count)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "有 $BEHIND 个新提交需要审查"
+            # 获取更新摘要
+            echo 'summary<<EOF' >> $GITHUB_OUTPUT
+            git log HEAD..upstream/develop --oneline --no-merges | head -30 >> $GITHUB_OUTPUT
+            echo 'EOF' >> $GITHUB_OUTPUT
+          else
+            echo "已是最新，无需同步"
+          fi
+
+      - name: 创建同步分支
+        if: steps.check.outputs.behind > 0
+        run: |
+          BRANCH="upstream-sync/$(date +%Y%m%d)"
+          git checkout -b $BRANCH upstream/develop
+          git push origin $BRANCH
+          echo "branch=$BRANCH" >> $GITHUB_ENV
+
+      - name: 创建 PR（等待人工审批）
+        if: steps.check.outputs.behind > 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "🔄 Chatwoot 官方更新同步 ($(date +%Y-%m-%d))" \
+            --body "$(cat <<PREOF
+          ## Chatwoot 官方更新
+
+          官方有 **${{ steps.check.outputs.behind }}** 个新提交。
+
+          ### 更新内容（最近 30 条）
+          \`\`\`
+          ${{ steps.check.outputs.summary }}
+          \`\`\`
+
+          ### 审批流程
+          1. 查看 **Files changed** 标签页，检查有没有影响我们定制功能的改动
+          2. 重点关注以下目录的变更：
+             - \`app/views/\` — UI 相关，可能影响日本化定制
+             - \`app/models/\` — 数据模型，可能影响 custom_enterprise
+             - \`config/locales/\` — 多语言，可能覆盖日语翻译
+             - \`app/javascript/\` — 前端，可能影响 UI 定制
+          3. 如果没问题 → 点 **Merge pull request**
+          4. 如果有冲突 → 在评论里说明，AI 会处理
+
+          ### 注意
+          - **不要**使用 Squash merge，用默认的 Merge commit
+          - 合并后在本地测试再部署
+          PREOF
+          )" \
+            --base develop \
+            --head "${{ env.branch }}" \
+            --label "upstream-sync"
